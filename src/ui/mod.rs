@@ -1276,11 +1276,22 @@ impl App {
         unsafe {
             let mut buffer = vec![0u16; 32768];
             if save {
+                let displayed_path = Path::new(&self.name);
+                let copy_name = (self.path.is_none()
+                    && Format::detect(displayed_path) == Some(Format::Docx))
+                .then(|| {
+                    let stem = displayed_path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or(&self.name);
+                    format!("{stem} — копия")
+                });
                 let name = self
                     .path
                     .as_deref()
                     .and_then(Path::file_stem)
                     .and_then(|stem| stem.to_str())
+                    .or(copy_name.as_deref())
                     .unwrap_or(&self.name);
                 let utf16: Vec<u16> = name.encode_utf16().take(300).collect();
                 buffer[..utf16.len()].copy_from_slice(&utf16);
