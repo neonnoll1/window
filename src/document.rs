@@ -114,7 +114,100 @@ pub fn save(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 pub fn open_docx(path: &Path) -> Result<Vec<Paragraph>> {
-    read_docx(File::open(path)?)
+    read_docx(Cursor::new(read_file(path)?))
+}
+
+pub fn read_file(path: &Path) -> io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let oversized = || io::Error::new(io::ErrorKind::InvalidData, "Документ слишком большой");
+    if file.metadata()?.len() > MAX_FILE {
+        return Err(oversized());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FILE {
+        return Err(oversized());
+    }
+    Ok(bytes)
+}
+
+pub fn checked_rtf(bytes: &[u8]) -> io::Result<&[u8]> {
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    let bytes = bytes.trim_ascii();
+    // Some Rich Edit versions add a C string terminator when streaming a document out.
+    let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes).trim_ascii();
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "Некорректный документ RTF");
+    if !bytes.starts_with(b"{\\rtf1") {
+        return Err(invalid());
+    }
+    let mut depth = 0;
+    let mut cursor = 0;
+    while let Some(byte) = bytes.get(cursor) {
+        cursor += 1;
+        match byte {
+            b'{' => {
+                depth += 1;
+                if depth > 256 {
+                    return Err(invalid());
+                }
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 && cursor != bytes.len() {
+                    return Err(invalid());
+                }
+            }
+            b'\\' => {
+                let start = cursor;
+                while bytes.get(cursor).is_some_and(u8::is_ascii_alphabetic) {
+                    cursor += 1;
+                }
+                if cursor == start {
+                    // A control symbol consumes the following byte even when it is a brace.
+                    cursor += 1;
+                    continue;
+                }
+                let name = &bytes[start..cursor];
+                if [
+                    b"object".as_slice(),
+                    b"objdata",
+                    b"objlink",
+                    b"objautlink",
+                    b"objocx",
+                ]
+                .iter()
+                .any(|word| name.eq_ignore_ascii_case(word))
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Файл RTF содержит встроенный объект OLE",
+                    ));
+                }
+                if name.eq_ignore_ascii_case(b"bin") {
+                    let length_start = cursor;
+                    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+                        cursor += 1;
+                    }
+                    let length = std::str::from_utf8(&bytes[length_start..cursor])
+                        .ok()
+                        .and_then(|digits| digits.parse::<usize>().ok())
+                        .ok_or_else(invalid)?;
+                    if bytes.get(cursor) == Some(&b' ') {
+                        cursor += 1;
+                    }
+                    cursor = cursor
+                        .checked_add(length)
+                        .filter(|&end| end <= bytes.len())
+                        .ok_or_else(invalid)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err(invalid());
+    }
+    Ok(bytes)
 }
 
 fn part<R: Read + Seek>(zip: &mut ZipArchive<R>, name: &str) -> Result<Option<String>> {
@@ -170,27 +263,26 @@ fn read_docx<R: Read + Seek>(source: R) -> Result<Vec<Paragraph>> {
             Event::Start(ref element) | Event::Empty(ref element) => {
                 let opened = matches!(event, Event::Start(_));
                 let name = element.local_name();
-                let value = |key: &[u8]| -> Option<String> {
+                let value = |key: &str| -> Option<String> {
                     element
                         .attributes()
                         .flatten()
                         .find(|a| a.key.local_name().as_ref() == key)
                         .and_then(|a| {
-                            a.decode_and_unescape_value(reader.decoder())
+                            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
                                 .ok()
                                 .map(|s| s.into_owned())
                         })
                 };
                 match name.as_ref() {
-                    b"body" => {
+                    "body" => {
                         in_body = opened;
                         found_body = true;
                     }
-                    b"drawing" | b"pict" | b"object" | b"del" | b"moveFrom"
-                    | b"AlternateContent" => {
+                    "drawing" | "pict" | "object" | "del" | "moveFrom" | "AlternateContent" => {
                         skip_depth = usize::from(opened);
                     }
-                    b"p" if in_body => {
+                    "p" if in_body => {
                         let next = Paragraph::default();
                         if opened {
                             paragraph = Some(next);
@@ -199,27 +291,27 @@ fn read_docx<R: Read + Seek>(source: R) -> Result<Vec<Paragraph>> {
                             paragraphs.push(next);
                         }
                     }
-                    b"r" if paragraph.is_some() && opened => run = Some(Run::default()),
-                    b"pPr" if opened => in_properties = true,
-                    b"t" => in_text = opened && run.is_some(),
-                    b"tab" => {
+                    "r" if paragraph.is_some() && opened => run = Some(Run::default()),
+                    "pPr" if opened => in_properties = true,
+                    "t" => in_text = opened && run.is_some(),
+                    "tab" => {
                         if let Some(run) = &mut run {
                             run.text.push('\t');
                         }
                     }
-                    b"br" | b"cr" => {
+                    "br" | "cr" => {
                         if let Some(run) = &mut run {
                             run.text.push('\n');
                         }
                     }
-                    b"noBreakHyphen" => {
+                    "noBreakHyphen" => {
                         if let Some(run) = &mut run {
                             run.text.push('‑');
                         }
                     }
-                    b"jc" if in_properties => {
+                    "jc" if in_properties => {
                         if let Some(p) = &mut paragraph {
-                            p.align = match value(b"val").as_deref() {
+                            p.align = match value("val").as_deref() {
                                 Some("center") => Align::Center,
                                 Some("right" | "end") => Align::Right,
                                 Some("both" | "distribute") => Align::Justify,
@@ -227,15 +319,15 @@ fn read_docx<R: Read + Seek>(source: R) -> Result<Vec<Paragraph>> {
                             };
                         }
                     }
-                    b"numId" if in_properties => {
+                    "numId" if in_properties => {
                         if let Some(p) = &mut paragraph {
-                            p.list = value(b"val")
+                            p.list = value("val")
                                 .and_then(|id| lists.get(&id).copied())
                                 .unwrap_or_default();
                         }
                     }
-                    b"pStyle" if in_properties => {
-                        heading = match value(b"val")
+                    "pStyle" if in_properties => {
+                        heading = match value("val")
                             .unwrap_or_default()
                             .to_ascii_lowercase()
                             .as_str()
@@ -250,28 +342,28 @@ fn read_docx<R: Read + Seek>(source: R) -> Result<Vec<Paragraph>> {
                         if let Some(run) = &mut run {
                             let enabled = || {
                                 !matches!(
-                                    value(b"val").as_deref(),
+                                    value("val").as_deref(),
                                     Some("0" | "false" | "off" | "none")
                                 )
                             };
                             match name.as_ref() {
-                                b"b" => run.style.bold = enabled(),
-                                b"i" => run.style.italic = enabled(),
-                                b"u" => run.style.underline = enabled(),
-                                b"strike" | b"dstrike" => run.style.strike = enabled(),
-                                b"sz" => {
-                                    run.style.points = value(b"val")
+                                "b" => run.style.bold = enabled(),
+                                "i" => run.style.italic = enabled(),
+                                "u" => run.style.underline = enabled(),
+                                "strike" | "dstrike" => run.style.strike = enabled(),
+                                "sz" => {
+                                    run.style.points = value("val")
                                         .and_then(|s| s.parse::<u16>().ok())
                                         .map(|n| n.clamp(12, 192))
                                 }
-                                b"color" => {
-                                    run.style.color = value(b"val")
+                                "color" => {
+                                    run.style.color = value("val")
                                         .and_then(|s| u32::from_str_radix(&s, 16).ok())
                                         .filter(|n| *n <= 0xffffff)
                                 }
-                                b"rFonts" => {
-                                    run.style.font = value(b"hAnsi")
-                                        .or_else(|| value(b"ascii"))
+                                "rFonts" => {
+                                    run.style.font = value("hAnsi")
+                                        .or_else(|| value("ascii"))
                                         .filter(|s| s.chars().count() < 32)
                                 }
                                 _ => {}
@@ -281,10 +373,10 @@ fn read_docx<R: Read + Seek>(source: R) -> Result<Vec<Paragraph>> {
                 }
             }
             Event::End(element) => match element.local_name().as_ref() {
-                b"body" => in_body = false,
-                b"t" => in_text = false,
-                b"pPr" => in_properties = false,
-                b"r" => {
+                "body" => in_body = false,
+                "t" => in_text = false,
+                "pPr" => in_properties = false,
+                "r" => {
                     if let (Some(p), Some(mut r)) = (&mut paragraph, run.take()) {
                         if let Some(size) = heading {
                             if r.style.points.is_none() {
@@ -297,7 +389,7 @@ fn read_docx<R: Read + Seek>(source: R) -> Result<Vec<Paragraph>> {
                         }
                     }
                 }
-                b"p" => {
+                "p" => {
                     if let Some(p) = paragraph.take() {
                         paragraphs.push(p);
                     }
@@ -306,7 +398,7 @@ fn read_docx<R: Read + Seek>(source: R) -> Result<Vec<Paragraph>> {
             },
             Event::Text(value) if in_text => {
                 if let Some(r) = &mut run {
-                    r.text.push_str(&value.xml10_content()?);
+                    r.text.push_str(&value.xml10_content());
                 }
             }
             Event::GeneralRef(reference) if in_text => {
@@ -316,7 +408,7 @@ fn read_docx<R: Read + Seek>(source: R) -> Result<Vec<Paragraph>> {
                             r.text.push(ch);
                         }
                     } else if let Some(s) =
-                        quick_xml::escape::resolve_xml_entity(&reference.decode()?)
+                        quick_xml::escape::resolve_xml_entity(reference.as_ref())
                     {
                         r.text.push_str(s);
                     }
@@ -343,23 +435,23 @@ fn numbering(xml: &str) -> Result<HashMap<String, List>> {
         match event {
             Event::Eof => break,
             Event::Start(ref element) | Event::Empty(ref element) => {
-                let value = |key: &[u8]| -> Option<String> {
+                let value = |key: &str| -> Option<String> {
                     element
                         .attributes()
                         .flatten()
                         .find(|a| a.key.local_name().as_ref() == key)
                         .and_then(|a| {
-                            a.decode_and_unescape_value(reader.decoder())
+                            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
                                 .ok()
                                 .map(|s| s.into_owned())
                         })
                 };
                 match element.local_name().as_ref() {
-                    b"abstractNum" => definition = value(b"abstractNumId"),
-                    b"num" => number = value(b"numId"),
-                    b"numFmt" => {
+                    "abstractNum" => definition = value("abstractNumId"),
+                    "num" => number = value("numId"),
+                    "numFmt" => {
                         if let Some(id) = &definition {
-                            let list = match value(b"val").as_deref() {
+                            let list = match value("val").as_deref() {
                                 Some("bullet") => List::Bullet,
                                 Some("none") | None => List::None,
                                 _ => List::Number,
@@ -367,8 +459,8 @@ fn numbering(xml: &str) -> Result<HashMap<String, List>> {
                             definitions.entry(id.clone()).or_insert(list);
                         }
                     }
-                    b"abstractNumId" => {
-                        if let (Some(id), Some(value)) = (&number, value(b"val")) {
+                    "abstractNumId" => {
+                        if let (Some(id), Some(value)) = (&number, value("val")) {
                             references.insert(id.clone(), value);
                         }
                     }
@@ -376,8 +468,8 @@ fn numbering(xml: &str) -> Result<HashMap<String, List>> {
                 }
             }
             Event::End(element) => match element.local_name().as_ref() {
-                b"abstractNum" => definition = None,
-                b"num" => number = None,
+                "abstractNum" => definition = None,
+                "num" => number = None,
                 _ => {}
             },
             _ => {}
@@ -647,5 +739,17 @@ mod tests {
         let encoded = String::from_utf8(encoded).unwrap();
         assert!(encoded.contains(r"\{\\\}"));
         assert!(encoded.ends_with(r"\u-10179?\u-8704?}}"));
+    }
+
+    #[test]
+    fn checks_rtf_before_passing_it_to_richedit() {
+        assert!(checked_rtf(br"{\rtf1 \b Text \\object \{literal\}}").is_ok());
+        assert_eq!(checked_rtf(b"{\\rtf1 Text}\0").unwrap(), br"{\rtf1 Text}");
+        assert!(checked_rtf(br"{\rtf1 {\pict\bin4 {}{}}}").is_ok());
+        assert!(checked_rtf(br"{\rtf1 {\*\ObjEcT\objemb test}}").is_err());
+        assert!(checked_rtf(br"{\rtf1 {\*\objdata test}}").is_err());
+        assert!(checked_rtf(br"{\rtf1 {\pict\bin42 data}}").is_err());
+        assert!(checked_rtf(br"{\rtf1 text").is_err());
+        assert!(checked_rtf(br"{\rtf1 text}{\object}").is_err());
     }
 }
