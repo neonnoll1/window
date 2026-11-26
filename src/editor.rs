@@ -1,3 +1,5 @@
+mod ole;
+
 use crate::document::{self, Align, List, Paragraph, Run, Style};
 use std::{io, mem, ptr, slice};
 use windows_sys::Win32::{
@@ -40,6 +42,7 @@ const GET_PARA: u32 = WM_USER + 61;
 const SET_CHAR: u32 = WM_USER + 68;
 const SET_EVENTS: u32 = WM_USER + 69;
 const SET_PARA: u32 = WM_USER + 71;
+const SET_OLE_CALLBACK: u32 = WM_USER + 70;
 const STREAM_IN: u32 = WM_USER + 73;
 const STREAM_OUT: u32 = WM_USER + 74;
 const CAN_REDO: u32 = WM_USER + 85;
@@ -238,6 +241,10 @@ impl Editor {
                 ptr::null(),
             );
             let edit = Self(handle);
+            if !handle.is_null() && edit.send(SET_OLE_CALLBACK, 0, ole::callback()) == 0 {
+                DestroyWindow(handle);
+                return Self(ptr::null_mut());
+            }
             if !handle.is_null() {
                 edit.send(WM_USER + 67, 0, 0x00ff_ffff);
                 edit.send(WM_USER + 53, 0, LIMIT as isize);

@@ -8,7 +8,7 @@ use paint::{Fonts, Glyph};
 use std::{
     cell::RefCell,
     ffi::OsString,
-    fs, io, mem,
+    io, mem,
     os::windows::ffi::OsStringExt,
     path::{Path, PathBuf},
     ptr,
@@ -1151,9 +1151,6 @@ impl App {
         }
         let result: Result<_, Box<dyn std::error::Error>> = (|| {
             let format = Format::detect(&path).ok_or("Выберите файл RTF, TXT или DOCX")?;
-            if fs::metadata(&path)?.len() > document::MAX_FILE {
-                return Err("Документ слишком большой".into());
-            }
             match format {
                 Format::Docx => {
                     let paragraphs = document::open_docx(&path)?;
@@ -1161,15 +1158,12 @@ impl App {
                     self.editor.restore_docx_lists(&paragraphs);
                 }
                 Format::Rtf => {
-                    let bytes = fs::read(&path)?;
-                    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
-                    let start = bytes
-                        .iter()
-                        .position(|byte| !byte.is_ascii_whitespace())
-                        .unwrap_or(bytes.len());
-                    self.replace_rtf(&bytes[start..])?;
+                    let bytes = document::read_file(&path)?;
+                    self.replace_rtf(document::checked_rtf(&bytes)?)?;
                 }
-                Format::Txt => self.editor.text(&document::decode_text(&fs::read(&path)?)?),
+                Format::Txt => self
+                    .editor
+                    .text(&document::decode_text(&document::read_file(&path)?)?),
             }
             Ok(format)
         })();
