@@ -36,3 +36,9 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path $exe)) {
             throw "Microsoft Defender did not pass the binary (exit code $LASTEXITCODE)."
           }
+      - name: Keep the executable that passed the scan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: WindRu-0.1.1-windows-x64
+          path: target/release/WindRu.exe
+          if-no-files-found: error
