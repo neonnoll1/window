@@ -1,0 +1,38 @@
+name: Verify WindRu with Microsoft Defender
+on:
+  push:
+    branches: [windru-defender-check]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Build Windows binary
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=amd64
+          if errorlevel 1 exit /b 1
+          cargo test --locked
+          if errorlevel 1 exit /b 1
+          cargo build --locked --release
+      - name: Scan with Microsoft Defender
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $status = Get-MpComputerStatus
+          if (-not $status.AMServiceEnabled -or -not $status.AntivirusEnabled) {
+            throw 'Microsoft Defender Antivirus is unavailable on this runner.'
+          }
+          $status | Select-Object AMProductVersion, AMEngineVersion, AntivirusSignatureVersion | Format-List
+          $exe = (Resolve-Path target\release\WindRu.exe).Path
+          $tool = Get-ChildItem "$env:ProgramData\Microsoft\Windows Defender\Platform\*\MpCmdRun.exe" |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $tool) { throw 'Microsoft Defender command-line scanner was unavailable.' }
+          Get-FileHash -Algorithm SHA256 $exe
+          & $tool.FullName -Scan -ScanType 3 -File $exe -DisableRemediation
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $exe)) {
+            throw "Microsoft Defender did not pass the binary (exit code $LASTEXITCODE)."
+          }
